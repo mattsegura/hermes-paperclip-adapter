@@ -23,6 +23,8 @@ import type {
   AdapterExecutionResult,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
+import { readdir, stat } from "node:fs/promises";
+import path from "node:path";
 
 import {
   runChildProcess,
@@ -63,15 +65,64 @@ function cfgStringArray(v: unknown): string[] | undefined {
     : undefined;
 }
 
+function envString(name: string): string | undefined {
+  return cfgString(process.env[name]?.trim());
+}
+
+function runtimeDefaultModel(): string {
+  return (
+    envString("BUSINESS_RUNTIME_AGENT_MODEL") ||
+    envString("LYNK_CHAT_MODEL") ||
+    envString("HERMES_AGENT_MODEL") ||
+    envString("HERMES_MODEL") ||
+    envString("DEFAULT_MODEL") ||
+    DEFAULT_MODEL
+  );
+}
+
+function runtimeDefaultProvider(): string | undefined {
+  const configured =
+    envString("BUSINESS_RUNTIME_AGENT_PROVIDER") ||
+    envString("LYNK_CHAT_PROVIDER") ||
+    envString("HERMES_AGENT_PROVIDER") ||
+    envString("HERMES_PROVIDER") ||
+    envString("DEFAULT_PROVIDER");
+  if (configured) return configured;
+  if (envString("OPENROUTER_API_KEY") && !envString("ANTHROPIC_API_KEY") && !envString("ANTHROPIC_TOKEN")) {
+    return "openrouter";
+  }
+  return undefined;
+}
+
+function resolvePaperclipApiUrl(config: Record<string, unknown>): string {
+  const configured =
+    cfgString(config.paperclipApiUrl) ||
+    process.env.PAPERCLIP_API_URL ||
+    "http://127.0.0.1:3100/api";
+  return configured.endsWith("/api")
+    ? configured
+    : configured.replace(/\/+$/, "") + "/api";
+}
+
+function resolveRuntimeApiToken(env: Record<string, string>): string | undefined {
+  return (
+    cfgString(env.PAPERCLIP_API_KEY) ||
+    cfgString(env.PAPERCLIP_API_TOKEN) ||
+    cfgString(env.PAPERCLIP_LYNK_INTERNAL_TOKEN) ||
+    cfgString(env.BOARD_OPERATOR_API_TOKEN) ||
+    cfgString(env.LYNK_API_TOKEN)
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PROMPT_TEMPLATE = `You are "{{agentName}}", an AI agent employee in a Paperclip-managed company.
+const DEFAULT_PROMPT_TEMPLATE = `You are "{{agentName}}", an AI agent employee in a Lynk-managed company.
 
-IMPORTANT: Use \`terminal\` tool with \`curl\` for ALL Paperclip API calls (web_extract and browser cannot access localhost).
+IMPORTANT: Use \`terminal\` tool with \`curl\` for ALL Lynk runtime API calls (web_extract and browser cannot access localhost).
 
-Your Paperclip identity:
+Your Lynk runtime identity:
   Agent ID: {{agentId}}
   Company ID: {{companyId}}
   API Base: {{paperclipApiUrl}}
@@ -98,9 +149,10 @@ Title: {{taskTitle}}
 {{#commentId}}
 ## Comment on This Issue
 
-Someone commented. Read it:
-   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
+Someone commented. Read it with plain curl only:
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}"\`
 
+Do not use shell pipes, python, jq, xargs, or chained shell parsing for normal Lynk runtime reads.
 Address the comment, POST a reply if needed, then continue working.
 {{/commentId}}
 
@@ -108,15 +160,17 @@ Address the comment, POST a reply if needed, then continue working.
 ## Heartbeat Wake — Check for Work
 
 1. List ALL open issues assigned to you (todo, backlog, in_progress):
-   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}"\`
+   Read the JSON directly and identify any issues whose status is not \`done\` or \`cancelled\`.
 
 2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
    - Read the issue details: \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
    - Do the work in the project directory: {{projectName}}
    - When done, mark complete and post a comment (see Workflow steps 2-4 above)
 
-3. If no issues assigned to you, check for unassigned issues:
-   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+3. If no issues are assigned to you, check for unassigned backlog issues:
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog"\`
+   Read the JSON directly and identify any issue with no assignee.
    If you find a relevant issue, assign it to yourself:
    \`curl -s -X PATCH -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
 
@@ -129,24 +183,16 @@ function buildPrompt(
 ): string {
   const template = cfgString(config.promptTemplate) || DEFAULT_PROMPT_TEMPLATE;
 
-  const taskId = cfgString(ctx.config?.taskId);
-  const taskTitle = cfgString(ctx.config?.taskTitle) || "";
-  const taskBody = cfgString(ctx.config?.taskBody) || "";
-  const commentId = cfgString(ctx.config?.commentId) || "";
-  const wakeReason = cfgString(ctx.config?.wakeReason) || "";
+  const taskId = cfgString(config.taskId) || cfgString(ctx.config?.taskId);
+  const taskTitle = cfgString(config.taskTitle) || cfgString(ctx.config?.taskTitle) || "";
+  const taskBody = cfgString(config.taskBody) || cfgString(ctx.config?.taskBody) || "";
+  const commentId = cfgString(config.commentId) || cfgString(ctx.config?.commentId) || "";
+  const wakeReason = cfgString(config.wakeReason) || cfgString(ctx.config?.wakeReason) || "";
   const agentName = ctx.agent?.name || "Hermes Agent";
   const companyName = cfgString(ctx.config?.companyName) || "";
   const projectName = cfgString(ctx.config?.projectName) || "";
 
-  // Build API URL — ensure it has the /api path
-  let paperclipApiUrl =
-    cfgString(config.paperclipApiUrl) ||
-    process.env.PAPERCLIP_API_URL ||
-    "http://127.0.0.1:3100/api";
-  // Ensure /api suffix
-  if (!paperclipApiUrl.endsWith("/api")) {
-    paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
-  }
+  const paperclipApiUrl = resolvePaperclipApiUrl(config);
 
   const vars: Record<string, unknown> = {
     agentId: ctx.agent?.id || "",
@@ -213,6 +259,25 @@ interface ParsedOutput {
   errorMessage?: string;
 }
 
+interface WorkspaceFileState {
+  size: number;
+  mtimeMs: number;
+}
+
+type WorkspaceSnapshot = Map<string, WorkspaceFileState>;
+
+const WORKSPACE_SNAPSHOT_LIMIT = 5000;
+const WORKSPACE_CHANGED_FILE_LIMIT = 30;
+const WORKSPACE_IGNORED_DIRS = new Set([
+  ".git",
+  "node_modules",
+  ".next",
+  "dist",
+  "build",
+  ".cache",
+  ".turbo",
+]);
+
 // ---------------------------------------------------------------------------
 // Response cleaning
 // ---------------------------------------------------------------------------
@@ -254,13 +319,18 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   <response text>
   //
   //   session_id: <id>
-  const sessionMatch = stdout.match(SESSION_ID_REGEX);
+  const sessionMatch = combined.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
     result.sessionId = sessionMatch?.[1] ?? null;
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
       result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
+    } else {
+      const cleaned = cleanResponse(stdout);
+      if (cleaned.length > 0) {
+        result.response = cleaned;
+      }
     }
   } else {
     // Legacy format (non-quiet mode)
@@ -306,17 +376,315 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace/result reconciliation
+// ---------------------------------------------------------------------------
+
+async function snapshotWorkspace(
+  root: string,
+  limit = WORKSPACE_SNAPSHOT_LIMIT,
+): Promise<WorkspaceSnapshot | null> {
+  const out: WorkspaceSnapshot = new Map();
+
+  async function visit(dir: string): Promise<void> {
+    if (out.size >= limit) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (out.size >= limit) return;
+      if (entry.name.startsWith(".") && entry.name !== ".env.example" && entry.name !== ".gitignore") {
+        if (entry.isDirectory() && WORKSPACE_IGNORED_DIRS.has(entry.name)) continue;
+      }
+      const absolute = path.join(dir, entry.name);
+      const relative = path.relative(root, absolute);
+      if (entry.isDirectory()) {
+        if (WORKSPACE_IGNORED_DIRS.has(entry.name)) continue;
+        await visit(absolute);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      try {
+        const info = await stat(absolute);
+        out.set(relative, { size: info.size, mtimeMs: info.mtimeMs });
+      } catch {
+        // Ignore files that disappeared while the agent was still working.
+      }
+    }
+  }
+
+  await visit(root);
+  return out;
+}
+
+function changedWorkspaceFiles(
+  before: WorkspaceSnapshot | null,
+  after: WorkspaceSnapshot | null,
+): string[] {
+  if (!before || !after) return [];
+  const changed: string[] = [];
+  for (const [file, state] of after) {
+    const previous = before.get(file);
+    if (!previous || previous.size !== state.size || previous.mtimeMs !== state.mtimeMs) {
+      changed.push(file);
+    }
+  }
+  return changed.sort().slice(0, WORKSPACE_CHANGED_FILE_LIMIT);
+}
+
+async function paperclipJsonRequest(
+  apiUrl: string,
+  token: string | undefined,
+  method: string,
+  endpoint: string,
+  body?: Record<string, unknown>,
+  runId?: string,
+): Promise<unknown | null> {
+  if (!token) return null;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+  if (runId) {
+    headers["x-paperclip-run-id"] = runId;
+  }
+  const response = await fetch(`${apiUrl}${endpoint}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Runtime ${method} ${endpoint} failed: ${response.status} ${text}`);
+  }
+  if (response.status === 204) return null;
+  return response.json().catch(() => null);
+}
+
+function recordValue(record: unknown, key: string): unknown {
+  return record && typeof record === "object"
+    ? (record as Record<string, unknown>)[key]
+    : undefined;
+}
+
+function recordString(record: unknown, key: string): string | undefined {
+  const value = recordValue(record, key);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function issuePriorityRank(issue: unknown): number {
+  switch (recordString(issue, "priority")) {
+    case "urgent":
+      return 0;
+    case "high":
+      return 1;
+    case "medium":
+      return 2;
+    case "low":
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+function issueStatusRank(issue: unknown): number {
+  switch (recordString(issue, "status")) {
+    case "in_progress":
+      return 0;
+    case "todo":
+      return 1;
+    case "backlog":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+function openAssignedIssue(issue: unknown): boolean {
+  const status = recordString(issue, "status");
+  return Boolean(recordString(issue, "id")) && status !== "done" && status !== "cancelled";
+}
+
+async function enrichConfigWithAssignedIssue(input: {
+  config: Record<string, unknown>;
+  apiUrl: string;
+  token: string | undefined;
+  agentId: string | undefined;
+  companyId: string | undefined;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<Record<string, unknown>> {
+  if (cfgString(input.config.taskId) || !input.token || !input.agentId || !input.companyId) {
+    return input.config;
+  }
+
+  try {
+    const issues = await paperclipJsonRequest(
+      input.apiUrl,
+      input.token,
+      "GET",
+      `/companies/${encodeURIComponent(input.companyId)}/issues?assigneeAgentId=${encodeURIComponent(input.agentId)}`,
+    );
+    if (!Array.isArray(issues)) return input.config;
+
+    const selected = issues
+      .filter(openAssignedIssue)
+      .sort((a, b) => issuePriorityRank(a) - issuePriorityRank(b) || issueStatusRank(a) - issueStatusRank(b))[0];
+    const issueId = recordString(selected, "id");
+    if (!issueId) return input.config;
+
+    const detailed = await paperclipJsonRequest(
+      input.apiUrl,
+      input.token,
+      "GET",
+      `/issues/${encodeURIComponent(issueId)}`,
+    );
+    const issue = detailed && typeof detailed === "object" ? detailed : selected;
+    const project = recordValue(issue, "project");
+    const workspace =
+      recordValue(project, "primaryWorkspace") ||
+      recordValue(project, "codebase") ||
+      null;
+    const workspaceDir =
+      recordString(workspace, "cwd") ||
+      recordString(workspace, "effectiveLocalFolder") ||
+      recordString(recordValue(project, "codebase"), "effectiveLocalFolder") ||
+      recordString(recordValue(project, "codebase"), "localFolder");
+
+    await input.onLog(
+      "stdout",
+      `[runtime] Resolved assigned issue ${recordString(issue, "identifier") || issueId} for generic wakeup.\n`,
+    );
+
+    return {
+      ...input.config,
+      taskId: issueId,
+      taskTitle: recordString(issue, "title") || "",
+      taskBody: recordString(issue, "description") || "",
+      projectName: recordString(project, "name") || "",
+      workspaceDir: workspaceDir || input.config.workspaceDir,
+    };
+  } catch (error) {
+    await input.onLog(
+      "stderr",
+      `[runtime] Failed to resolve assigned issue for wakeup: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return input.config;
+  }
+}
+
+async function reconcileSuccessfulTaskRun(input: {
+  apiUrl: string;
+  token: string | undefined;
+  taskId: string;
+  runId: string | undefined;
+  agentId: string | undefined;
+  agentName: string;
+  summary: string;
+  changedFiles: string[];
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  if (!input.token) return;
+
+  const issue = await paperclipJsonRequest(
+    input.apiUrl,
+    input.token,
+    "GET",
+    `/issues/${encodeURIComponent(input.taskId)}`,
+    undefined,
+    input.runId,
+  );
+  if (recordValue(issue, "status") === "done") return;
+
+  if (input.agentId) {
+    await paperclipJsonRequest(
+      input.apiUrl,
+      input.token,
+      "POST",
+      `/issues/${encodeURIComponent(input.taskId)}/checkout`,
+      {
+        agentId: input.agentId,
+        expectedStatuses: ["backlog", "todo", "in_progress"],
+      },
+      input.runId,
+    );
+  }
+
+  const changedFilesLine = input.changedFiles.length
+    ? `\n\nChanged files:\n${input.changedFiles.map((file) => `- ${file}`).join("\n")}`
+    : "";
+  const body = `DONE: ${input.summary}${changedFilesLine}`;
+
+  await paperclipJsonRequest(
+    input.apiUrl,
+    input.token,
+    "POST",
+    `/issues/${encodeURIComponent(input.taskId)}/comments`,
+    { body },
+    input.runId,
+  );
+  await paperclipJsonRequest(
+    input.apiUrl,
+    input.token,
+    "PATCH",
+    `/issues/${encodeURIComponent(input.taskId)}`,
+    { status: "done" },
+    input.runId,
+  );
+  await input.onLog(
+    "stdout",
+    `[runtime] Reconciled successful task run back to issue ${input.taskId}.\n`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main execute
 // ---------------------------------------------------------------------------
 
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  let config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+
+  // ── Build environment ──────────────────────────────────────────────────
+  const env: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    ...buildPaperclipEnv(ctx.agent),
+  };
+
+  if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
+  if ((ctx as any).authToken && !env.PAPERCLIP_API_KEY)
+    env.PAPERCLIP_API_KEY = (ctx as any).authToken;
+  const runtimeApiToken = resolveRuntimeApiToken(env);
+  if (runtimeApiToken && !env.PAPERCLIP_API_KEY) {
+    env.PAPERCLIP_API_KEY = runtimeApiToken;
+  }
+
+  const userEnv = config.env as Record<string, string> | undefined;
+  if (userEnv && typeof userEnv === "object") {
+    Object.assign(env, userEnv);
+  }
+  const enrichedRuntimeApiToken = resolveRuntimeApiToken(env);
+  if (enrichedRuntimeApiToken && !env.PAPERCLIP_API_KEY) {
+    env.PAPERCLIP_API_KEY = enrichedRuntimeApiToken;
+  }
+
+  config = await enrichConfigWithAssignedIssue({
+    config,
+    apiUrl: resolvePaperclipApiUrl(config),
+    token: enrichedRuntimeApiToken,
+    agentId: ctx.agent?.id,
+    companyId: ctx.agent?.companyId,
+    onLog: ctx.onLog,
+  });
+  const taskId = cfgString(config.taskId);
+  if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
-  const model = cfgString(config.model) || DEFAULT_MODEL;
+  const model = cfgString(config.model) || runtimeDefaultModel();
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
@@ -337,7 +705,7 @@ export async function execute(
   // was added, or if the model was changed without updating provider, the
   // correct provider is still used.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
-  const explicitProvider = cfgString(config.provider);
+  const explicitProvider = cfgString(config.provider) || runtimeDefaultProvider();
 
   if (!explicitProvider) {
     try {
@@ -408,31 +776,18 @@ export async function execute(
     args.push(...extraArgs);
   }
 
-  // ── Build environment ──────────────────────────────────────────────────
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    ...buildPaperclipEnv(ctx.agent),
-  };
-
-  if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
-  if ((ctx as any).authToken && !env.PAPERCLIP_API_KEY)
-    env.PAPERCLIP_API_KEY = (ctx as any).authToken;
-  const taskId = cfgString(ctx.config?.taskId);
-  if (taskId) env.PAPERCLIP_TASK_ID = taskId;
-
-  const userEnv = config.env as Record<string, string> | undefined;
-  if (userEnv && typeof userEnv === "object") {
-    Object.assign(env, userEnv);
-  }
-
   // ── Resolve working directory ──────────────────────────────────────────
   const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+    cfgString(config.cwd) || cfgString(config.workspaceDir) || ".";
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {
     // Non-fatal
   }
+  const trackWorkspaceChanges = cfgBoolean(config.trackWorkspaceChanges) !== false;
+  const workspaceBefore = trackWorkspaceChanges
+    ? await snapshotWorkspace(cwd)
+    : null;
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
@@ -477,6 +832,10 @@ export async function execute(
     graceSec,
     onLog: wrappedOnLog,
   });
+  const workspaceAfter = trackWorkspaceChanges
+    ? await snapshotWorkspace(cwd)
+    : null;
+  const changedFiles = changedWorkspaceFiles(workspaceBefore, workspaceAfter);
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
@@ -515,12 +874,40 @@ export async function execute(
     executionResult.summary = parsed.response.slice(0, 2000);
   }
 
+  const successfulTaskRun = result.exitCode === 0 && !result.timedOut && taskId;
+  if (!executionResult.summary && successfulTaskRun && changedFiles.length > 0) {
+    const fileList = changedFiles.slice(0, 5).join(", ");
+    executionResult.summary = `${ctx.agent?.name || "Hermes Agent"} completed the task and updated workspace file${changedFiles.length === 1 ? "" : "s"}: ${fileList}${changedFiles.length > 5 ? ", ..." : ""}`;
+  }
+
+  if (successfulTaskRun && executionResult.summary) {
+    try {
+      await reconcileSuccessfulTaskRun({
+        apiUrl: resolvePaperclipApiUrl(config),
+        token: resolveRuntimeApiToken(env),
+        taskId,
+        runId: ctx.runId,
+        agentId: ctx.agent?.id,
+        agentName: ctx.agent?.name || "Hermes Agent",
+        summary: executionResult.summary,
+        changedFiles,
+        onLog: ctx.onLog,
+      });
+    } catch (error) {
+      await ctx.onLog(
+        "stderr",
+        `[runtime] Failed to reconcile successful task run: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+
   // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
   executionResult.resultJson = {
-    result: parsed.response || "",
+    result: executionResult.summary || parsed.response || "",
     session_id: parsed.sessionId || null,
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
+    changed_files: changedFiles,
   };
 
   // Store session ID for next run
